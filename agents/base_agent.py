@@ -1,6 +1,7 @@
 """
 Agent 基类
 提供统一的 LLM 调用、Prompt 模板、Few-Shot 示例管理
+支持 RAG 增强生成
 """
 import json
 from abc import ABC, abstractmethod
@@ -39,10 +40,11 @@ FEW_SHOT_EXAMPLES = {
 class BaseAgent(ABC):
     """Agent 基类"""
     
-    def __init__(self, state_manager, tool_gateway, web_services):
+    def __init__(self, state_manager, tool_gateway, web_services, rag_engine=None):
         self.state_manager = state_manager
         self.tool_gateway = tool_gateway
         self.web_services = web_services
+        self.rag_engine = rag_engine  # RAG 引擎 (可选)
         self.model = DEFAULT_MODEL
     
     @property
@@ -64,9 +66,10 @@ class BaseAgent(ABC):
     def build_prompt(
         self, 
         user_input: str, 
-        context: Optional[Dict[str, Any]] = None
+        context: Optional[Dict[str, Any]] = None,
+        is_code_generation: bool = False
     ) -> str:
-        """构建完整 Prompt"""
+        """构建完整 Prompt (支持 RAG 增强)"""
         examples = self.get_few_shot_examples(self.role.lower())
         
         prompt_parts = [
@@ -85,6 +88,16 @@ class BaseAgent(ABC):
         prompt_parts.append("")
         prompt_parts.append("## Current Task")
         
+        # RAG 增强：检索长期记忆并注入上下文
+        if self.rag_engine and user_input:
+            augmented_prompt = self.rag_engine.augment_prompt(
+                base_prompt="",  # 基础部分已在上面构建
+                query=user_input,
+                is_code_generation=is_code_generation
+            )
+            if augmented_prompt:
+                prompt_parts.insert(0, augmented_prompt)
+        
         if context:
             prompt_parts.append(f"Context: {json.dumps(context, ensure_ascii=False)}")
         
@@ -94,8 +107,8 @@ class BaseAgent(ABC):
         
         return "\n".join(prompt_parts)
     
-    def call_llm(self, prompt: str) -> Optional[Dict[str, Any]]:
-        """调用 LLM (支持模拟模式)"""
+    def call_llm(self, prompt: str, is_code_generation: bool = False) -> Optional[Dict[str, Any]]:
+        """调用 LLM (支持模拟模式和 RAG 安全过滤)"""
         if SIMULATION_MODE or not DASHSCOPE_API_KEY:
             return self._simulate_response(prompt)
         
@@ -111,6 +124,16 @@ class BaseAgent(ABC):
             
             if response.status_code == 200:
                 content = response.output.choices[0].message.content
+                
+                # RAG 后处理：安全检查
+                if self.rag_engine and is_code_generation:
+                    filtered_content = self.rag_engine.process_response(content)
+                    if filtered_content is None:
+                        # 内容不安全，返回模拟响应
+                        print(f"[Security] Response filtered for safety [{self.role}]")
+                        return self._simulate_response(prompt)
+                    content = filtered_content
+                
                 return self._parse_json_response(content)
         except Exception as e:
             print(f"LLM 调用失败 [{self.role}]: {e}")

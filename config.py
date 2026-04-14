@@ -26,6 +26,13 @@ REQUEST_TIMEOUT = 30  # 请求超时时间 (秒)
 DEFAULT_MODEL = "qwen-max"  # 默认使用 Qwen-Max
 FAST_MODEL = "qwen-turbo"  # 快速任务使用 Qwen-Turbo
 
+# RAG & Memory 配置
+RAG_ENABLED = True
+RAG_TOP_K = 5                # 检索返回的最大条目数
+RAG_SIMILARITY_THRESHOLD = 0.75  # 最低相似度阈值
+RAG_MEMORY_CATEGORIES = ["user_profile", "preferences", "business_fact", "reflection"]  # 需要检索的记忆类别
+RAG_MAX_CONTEXT_ITEMS = 5    # System Prompt 中最多注入几条记忆
+
 # 网络检测
 NETWORK_CHECK_URL = "https://www.baidu.com"
 NETWORK_CHECK_TIMEOUT = 5

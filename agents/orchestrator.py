@@ -49,9 +49,10 @@ class OrchestratorAgent(BaseAgent):
 3. 对于模糊请求要主动询问
 4. 输出必须是合法的 JSON 格式"""
     
-    def __init__(self, state_manager, tool_gateway, web_services, agents: Dict[str, BaseAgent]):
-        super().__init__(state_manager, tool_gateway, web_services)
+    def __init__(self, state_manager, tool_gateway, web_services, agents: Dict[str, BaseAgent], rag_engine=None):
+        super().__init__(state_manager, tool_gateway, web_services, rag_engine=rag_engine)
         self.agents = agents
+        self.rag_engine = rag_engine  # RAG 引擎
     
     async def process(self, user_input: str, **kwargs) -> Optional[Dict[str, Any]]:
         # 第一步：识别意图

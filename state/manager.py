@@ -698,18 +698,91 @@ class StateManager:
             if cat not in by_category:
                 by_category[cat] = {"count": 0, "total_conf": 0}
             by_category[cat]["count"] += 1
-            conf = memory.compute_decayed_confidence()
-            by_category[cat]["total_conf"] += conf
-            avg_confidence += conf
+            by_category[cat]["total_conf"] += memory.compute_decayed_confidence()
         
-        # 计算各类别平均置信度
-        for cat in by_category:
-            count = by_category[cat]["count"]
-            by_category[cat]["avg_confidence"] = by_category[cat]["total_conf"] / count if count > 0 else 0
+        if total > 0:
+            avg_confidence = sum(
+                m.compute_decayed_confidence() 
+                for m in self.long_term_memories.values()
+            ) / total
         
         return {
             "total_memories": total,
-            "by_category": by_category,
-            "avg_confidence": avg_confidence / total if total > 0 else 0,
+            "by_category": {
+                cat: {
+                    "count": data["count"],
+                    "avg_confidence": data["total_conf"] / data["count"] if data["count"] > 0 else 0
+                }
+                for cat, data in by_category.items()
+            },
+            "average_confidence": avg_confidence,
             "queue_size": len(self._memory_write_queue)
         }
+
+    def retrieve_relevant_memories(
+        self, 
+        query: str, 
+        top_k: int = 3, 
+        category_filter: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        基于语义检索相关的长期记忆 (RAG 核心方法)
+        
+        参数:
+        - query: 查询文本
+        - top_k: 返回最相关的 K 条记忆
+        - category_filter: 类别过滤列表 (如 ['user_profile', 'business_fact'])
+        
+        返回: 按相似度排序的记忆列表
+        """
+        if not self.long_term_memories:
+            return []
+        
+        # 将查询转换为向量
+        query_vector = self.embedder.encode(query)
+        
+        # 计算所有记忆与查询的相似度
+        scored_memories = []
+        
+        for memory in self.long_term_memories.values():
+            # 类别过滤
+            if category_filter and memory.category not in category_filter:
+                continue
+            
+            # 置信度过滤 (低于阈值的记忆不参与检索)
+            current_conf = memory.compute_decayed_confidence()
+            if current_conf < 0.3:
+                continue
+            
+            # 将记忆内容转换为文本用于向量化
+            content_text = json.dumps(memory.content, ensure_ascii=False)
+            memory_vector = self.embedder.encode(content_text)
+            
+            # 计算余弦相似度
+            similarity = cosine_similarity(
+                query_vector.reshape(1, -1),
+                memory_vector.reshape(1, -1)
+            )[0][0]
+            
+            # 加权分数：相似度 * 置信度 (确保高置信度的记忆优先)
+            weighted_score = similarity * current_conf
+            
+            # 记录访问
+            memory.record_access()
+            
+            scored_memories.append({
+                "id": memory.id,
+                "category": memory.category,
+                "content": memory.content,
+                "confidence": current_conf,
+                "similarity": float(similarity),
+                "weighted_score": float(weighted_score),
+                "timestamp": memory.updated_at.isoformat(),
+                "source": "LongTermMemory"
+            })
+        
+        # 按加权分数降序排序
+        scored_memories.sort(key=lambda x: x["weighted_score"], reverse=True)
+        
+        return scored_memories[:top_k]
+
