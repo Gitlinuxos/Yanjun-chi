@@ -5,7 +5,16 @@
 import os
 
 # Qwen DashScope API Key (必需)
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "your_qwen_api_key_here")
+# 强制从环境变量获取，不提供默认值
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
+if DASHSCOPE_API_KEY is None:
+    import warnings
+    warnings.warn(
+        "DASHSCOPE_API_KEY 未设置！请通过环境变量设置有效的 API 密钥。",
+        UserWarning,
+        stacklevel=2
+    )
+    DASHSCOPE_API_KEY = ""  # 空字符串表示未配置
 
 # 搜索 API Key (可选，用于联网搜索)
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
