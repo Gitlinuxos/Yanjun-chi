@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-旅行计划助手 V3.1 - 主入口
-基于 Qwen 大模型的多智能体协作系统
+旅行计划助手 V3.3 - 主入口
+基于 Qwen 大模型的多智能体协作系统 (支持 RAG 增强生成)
 """
 import asyncio
 import sys
@@ -12,6 +12,7 @@ from config import DASHSCOPE_API_KEY, SIMULATION_MODE
 from state.manager import StateManager
 from tools.gateway import ToolGateway
 from tools.web_services import WebServices
+from agents.rag_engine import RAGEngine
 from agents import (
     OrchestratorAgent, ProfileAgent, DestinationAgent,
     TransportAgent, ItineraryAgent, BudgetAgent, WeatherAgent
@@ -36,34 +37,44 @@ class TravelAssistant:
         # 初始化工具网关
         self.tool_gateway = ToolGateway(self.state_manager)
         
-        # 初始化所有 Agent
+        # 初始化 RAG 引擎 (长期记忆检索与安全过滤)
+        self.rag_engine = RAGEngine(self.state_manager)
+        
+        # 初始化所有 Agent (注入 RAG 引擎)
         self.agents = {
             "profile_agent": ProfileAgent(
-                self.state_manager, self.tool_gateway, self.web_services
+                self.state_manager, self.tool_gateway, self.web_services,
+                rag_engine=self.rag_engine
             ),
             "destination_agent": DestinationAgent(
-                self.state_manager, self.tool_gateway, self.web_services
+                self.state_manager, self.tool_gateway, self.web_services,
+                rag_engine=self.rag_engine
             ),
             "transport_agent": TransportAgent(
-                self.state_manager, self.tool_gateway, self.web_services
+                self.state_manager, self.tool_gateway, self.web_services,
+                rag_engine=self.rag_engine
             ),
             "itinerary_agent": ItineraryAgent(
-                self.state_manager, self.tool_gateway, self.web_services
+                self.state_manager, self.tool_gateway, self.web_services,
+                rag_engine=self.rag_engine
             ),
             "budget_agent": BudgetAgent(
-                self.state_manager, self.tool_gateway, self.web_services
+                self.state_manager, self.tool_gateway, self.web_services,
+                rag_engine=self.rag_engine
             ),
             "weather_agent": WeatherAgent(
-                self.state_manager, self.tool_gateway, self.web_services
+                self.state_manager, self.tool_gateway, self.web_services,
+                rag_engine=self.rag_engine
             ),
         }
         
-        # 初始化协调者
+        # 初始化协调者 (注入 RAG 引擎)
         self.orchestrator = OrchestratorAgent(
             self.state_manager, 
             self.tool_gateway, 
             self.web_services,
-            self.agents
+            self.agents,
+            rag_engine=self.rag_engine
         )
         
         # 打印欢迎信息
