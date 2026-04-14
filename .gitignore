@@ -1,1 +1,41 @@
-Nothing should be ignored in this case, as the changes only include source code files (.py) and a documentation file (.md), with no build artifacts, dependencies, or temporary files present.
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Dependencies
+.venv/
+venv/
+env/
+.env
+.env.local
+.env.*
+requirements.txt.bak
+
+# Logs
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.Python
+```

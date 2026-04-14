@@ -204,6 +204,141 @@ class ConflictInfo(BaseModel):
     resolution: Optional[str] = Field(default=None, description="解决建议")
 
 
+class MemoryEntry(BaseModel):
+    """
+    长期记忆条目
+    支持衰减策略和冲突解决
+    """
+    id: str = Field(description="记忆唯一 ID")
+    agent_id: str = Field(description="创建/更新该记忆的 Agent ID")
+    category: Literal["user_profile", "identity", "business_fact", "reflection", "general"] = Field(
+        description="记忆类别"
+    )
+    content: Dict[str, Any] = Field(description="记忆内容")
+    
+    # 元数据
+    confidence: float = Field(ge=0.0, le=1.0, default=1.0, description="置信度")
+    created_at: datetime = Field(default_factory=datetime.now, description="创建时间")
+    updated_at: datetime = Field(default_factory=datetime.now, description="更新时间")
+    access_count: int = Field(default=0, description="访问次数")
+    last_accessed: Optional[datetime] = Field(default=None, description="最后访问时间")
+    
+    # 衰减参数
+    decay_rate: float = Field(default=0.01, description="基础衰减率 (每天)")
+    usage_boost: float = Field(default=0.05, description="每次访问提升的置信度")
+    max_confidence: float = Field(default=1.0, description="最大置信度")
+    
+    def compute_decayed_confidence(self) -> float:
+        """
+        计算衰减后的置信度
+        混合衰减策略：时间衰减 + 使用频率加权 + 置信度自衰减
+        """
+        now = datetime.now()
+        
+        # 时间衰减 (指数衰减)
+        days_elapsed = (now - self.created_at).total_seconds() / 86400
+        time_decay = self.decay_rate * days_elapsed
+        
+        # 使用频率加权 (访问越频繁，衰减越慢)
+        usage_factor = 1.0 / (1.0 + self.access_count * 0.1)
+        
+        # 置信度自衰减 (高置信度信息衰减更慢)
+        confidence_factor = 1.0 - (self.confidence * 0.3)
+        
+        # 综合衰减系数
+        total_decay = time_decay * usage_factor * confidence_factor
+        
+        # 计算衰减后置信度
+        decayed = self.confidence - total_decay
+        
+        return max(0.0, min(decayed, self.max_confidence))
+    
+    def record_access(self):
+        """记录访问，提升置信度"""
+        self.access_count += 1
+        self.last_accessed = datetime.now()
+        # 访问提升置信度，但不超过最大值
+        self.confidence = min(self.confidence + self.usage_boost, self.max_confidence)
+    
+    def should_prune(self, threshold: float = 0.2) -> bool:
+        """判断是否应该被剪枝 (置信度过低)"""
+        return self.compute_decayed_confidence() < threshold
+    
+    def merge_with(self, other: 'MemoryEntry', strategy: str = "confidence_weighted") -> 'MemoryEntry':
+        """
+        与另一个记忆条目合并
+        策略：
+        - confidence_weighted: 按置信度加权平均
+        - latest: 保留最新的
+        - higher_confidence: 保留置信度高的
+        """
+        if strategy == "latest":
+            if self.updated_at >= other.updated_at:
+                return self
+            else:
+                return other
+        
+        elif strategy == "higher_confidence":
+            self_conf = self.compute_decayed_confidence()
+            other_conf = other.compute_decayed_confidence()
+            if self_conf >= other_conf:
+                return self
+            else:
+                return other
+        
+        else:  # confidence_weighted
+            self_conf = self.compute_decayed_confidence()
+            other_conf = other.compute_decayed_confidence()
+            total_conf = self_conf + other_conf
+            
+            if total_conf == 0:
+                return self
+            
+            # 加权平均内容
+            merged_content = {}
+            all_keys = set(self.content.keys()) | set(other.content.keys())
+            
+            for key in all_keys:
+                self_val = self.content.get(key)
+                other_val = other.content.get(key)
+                
+                if self_val is None:
+                    merged_content[key] = other_val
+                elif other_val is None:
+                    merged_content[key] = self_val
+                elif isinstance(self_val, (int, float)) and isinstance(other_val, (int, float)):
+                    # 数值类型加权平均
+                    weight_self = self_conf / total_conf
+                    merged_content[key] = self_val * weight_self + other_val * (1 - weight_self)
+                else:
+                    # 非数值类型：选择置信度高的
+                    if self_conf >= other_conf:
+                        merged_content[key] = self_val
+                    else:
+                        merged_content[key] = other_val
+            
+            # 创建合并后的新条目
+            new_confidence = (self_conf * self_conf + other_conf * other_conf) / (self_conf + other_conf) if total_conf > 0 else 0
+            
+            return MemoryEntry(
+                id=self.id,  # 保留较早的 ID
+                agent_id=self.agent_id,
+                category=self.category,
+                content=merged_content,
+                confidence=min(new_confidence, self.max_confidence),
+                created_at=min(self.created_at, other.created_at),
+                updated_at=datetime.now(),
+                access_count=self.access_count + other.access_count,
+                last_accessed=max(
+                    self.last_accessed or self.created_at,
+                    other.last_accessed or other.created_at
+                ),
+                decay_rate=self.decay_rate,
+                usage_boost=self.usage_boost,
+                max_confidence=self.max_confidence
+            )
+
+
 class StagingArea(BaseModel):
     """
     临时区：存储待提交的修改补丁
@@ -269,6 +404,9 @@ class TravelPlanState(BaseModel):
     
     # 对话历史
     conversation_history: List[Dict[str, str]] = Field(default_factory=list)
+    
+    # 长期记忆存储
+    long_term_memories: List[Dict[str, Any]] = Field(default_factory=list)
     
     # 状态标记
     is_confirmed: bool = Field(default=False, description="计划是否已确认")
