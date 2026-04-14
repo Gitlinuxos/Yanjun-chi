@@ -4,12 +4,16 @@
 import json
 import hashlib
 import time
+import heapq
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-from .models import TravelPlanState, UserProfile, Destination, StatePatch, StagingArea, ConflictInfo
+from .models import (
+    TravelPlanState, UserProfile, Destination, StatePatch, StagingArea, 
+    ConflictInfo, MemoryEntry
+)
 from config import (
     CACHE_TTL_WEATHER, CACHE_TTL_TRANSPORT, CACHE_TTL_GENERAL,
     CACHE_SIMILARITY_THRESHOLD
@@ -72,7 +76,26 @@ class StateManager:
     - 维护旅行计划共享状态
     - 提供 KV-Cache 语义检索
     - 实现临时区 (Staging Area) 和两阶段提交
+    - 管理长期记忆 (衰减、冲突解决、优先级写回)
     """
+    
+    # 记忆类别优先级 (高价值信息优先写回)
+    MEMORY_PRIORITY = {
+        "user_profile": 1.0,      # 用户画像：最高优先级
+        "identity": 0.95,         # 身份属性
+        "business_fact": 0.9,     # 业务事实
+        "reflection": 0.85,       # LLM 反思结果
+        "general": 0.5            # 一般信息：最低优先级
+    }
+    
+    # 不同类别的衰减率配置
+    MEMORY_DECAY_RATES = {
+        "user_profile": 0.005,    # 用户画像衰减慢
+        "identity": 0.008,
+        "business_fact": 0.01,
+        "reflection": 0.02,       # 反思结果衰减较快
+        "general": 0.03           # 一般信息衰减最快
+    }
     
     def __init__(self):
         # 共享状态
@@ -92,6 +115,12 @@ class StateManager:
         
         # 状态版本哈希 (用于乐观锁)
         self._version_hash: str = self._compute_state_hash()
+        
+        # 长期记忆索引：memory_id -> MemoryEntry
+        self.long_term_memories: Dict[str, MemoryEntry] = {}
+        
+        # 记忆写入队列 (按优先级排序)
+        self._memory_write_queue: List[Tuple[float, MemoryEntry]] = []
     
     def _compute_state_hash(self) -> str:
         """计算当前状态的哈希值"""
@@ -346,4 +375,281 @@ class StateManager:
             "total_hits": hits,
             "expired_entries": expired,
             "hit_rate": hits / (hits + total) if (hits + total) > 0 else 0
+        }
+    
+    # ========== 长期记忆管理方法 ==========
+    
+    def _generate_memory_id(self, agent_id: str, category: str, content_hash: str) -> str:
+        """生成记忆唯一 ID"""
+        return f"{category}_{agent_id}_{content_hash[:16]}"
+    
+    def _compute_content_hash(self, content: Dict[str, Any]) -> str:
+        """计算内容哈希"""
+        content_str = json.dumps(content, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(content_str.encode()).hexdigest()
+    
+    def add_memory(
+        self,
+        agent_id: str,
+        category: str,
+        content: Dict[str, Any],
+        confidence: float = 1.0,
+        immediate: bool = False
+    ) -> Tuple[bool, str]:
+        """
+        添加/更新长期记忆
+        
+        参数:
+        - agent_id: 提交记忆的 Agent ID
+        - category: 记忆类别 (user_profile/identity/business_fact/reflection/general)
+        - content: 记忆内容
+        - confidence: 初始置信度
+        - immediate: 是否立即写回 (高优先级记忆可设为 True)
+        
+        返回：(是否成功，消息)
+        """
+        if category not in self.MEMORY_PRIORITY:
+            return False, f"Unknown memory category: {category}"
+        
+        content_hash = self._compute_content_hash(content)
+        memory_id = self._generate_memory_id(agent_id, category, content_hash)
+        
+        # 检查是否已存在相同内容的记忆
+        existing = self.long_term_memories.get(memory_id)
+        
+        if existing:
+            # 更新现有记忆：记录访问，提升置信度
+            existing.record_access()
+            existing.updated_at = datetime.now()
+            existing.content = content
+            return True, f"Updated existing memory: {memory_id}"
+        
+        # 创建新记忆条目
+        decay_rate = self.MEMORY_DECAY_RATES.get(category, 0.01)
+        new_memory = MemoryEntry(
+            id=memory_id,
+            agent_id=agent_id,
+            category=category,
+            content=content,
+            confidence=confidence,
+            decay_rate=decay_rate
+        )
+        
+        # 加入写入队列 (优先级，记忆)
+        priority = self.MEMORY_PRIORITY.get(category, 0.5)
+        heapq.heappush(self._memory_write_queue, (-priority, new_memory))
+        
+        if immediate or priority >= 0.9:
+            # 高优先级记忆立即写回
+            self._commit_memory_to_state(new_memory)
+            return True, f"High-priority memory committed immediately: {memory_id}"
+        
+        return True, f"Memory queued for write-back: {memory_id} (priority: {priority})"
+    
+    def flush_memory_queue(self, max_items: int = 10) -> int:
+        """
+        刷新记忆写入队列
+        按优先级顺序提交记忆到状态
+        
+        返回：实际提交的记忆数量
+        """
+        count = 0
+        while self._memory_write_queue and count < max_items:
+            neg_priority, memory = heapq.heappop(self._memory_write_queue)
+            
+            # 检查记忆是否应该被剪枝
+            if memory.should_prune():
+                continue
+            
+            # 检查是否有冲突
+            conflict = self._check_memory_conflict(memory)
+            if conflict:
+                # 解决冲突
+                resolved = self._resolve_memory_conflict(memory, conflict)
+                if resolved:
+                    self._commit_memory_to_state(resolved)
+                    count += 1
+            else:
+                self._commit_memory_to_state(memory)
+                count += 1
+        
+        return count
+    
+    def _commit_memory_to_state(self, memory: MemoryEntry):
+        """将记忆提交到状态存储"""
+        self.long_term_memories[memory.id] = memory
+        
+        # 同步到状态对象 (用于持久化)
+        self.state.long_term_memories.append({
+            "id": memory.id,
+            "category": memory.category,
+            "content": memory.content,
+            "confidence": memory.compute_decayed_confidence(),
+            "updated_at": memory.updated_at.isoformat()
+        })
+        
+        # 限制记忆数量
+        if len(self.state.long_term_memories) > 100:
+            self.state.long_term_memories = self.state.long_term_memories[-100:]
+    
+    def _check_memory_conflict(self, new_memory: MemoryEntry) -> Optional[MemoryEntry]:
+        """
+        检查新记忆是否与现有记忆冲突
+        冲突定义：同类别、内容键重叠但值不同
+        """
+        for existing in self.long_term_memories.values():
+            if existing.category != new_memory.category:
+                continue
+            if existing.id == new_memory.id:
+                continue
+            
+            # 检查内容是否有重叠键
+            common_keys = set(existing.content.keys()) & set(new_memory.content.keys())
+            if not common_keys:
+                continue
+            
+            # 检查重叠键的值是否冲突
+            for key in common_keys:
+                if existing.content[key] != new_memory.content[key]:
+                    return existing
+        
+        return None
+    
+    def _resolve_memory_conflict(
+        self, 
+        new_memory: MemoryEntry, 
+        existing: MemoryEntry,
+        strategy: str = "auto"
+    ) -> Optional[MemoryEntry]:
+        """
+        解决记忆冲突
+        
+        策略:
+        - auto: 自动选择 (基于置信度和时间戳)
+        - merge: 合并两个记忆
+        - keep_new: 保留新的
+        - keep_existing: 保留现有的
+        """
+        if strategy == "keep_new":
+            return new_memory
+        elif strategy == "keep_existing":
+            return existing
+        elif strategy == "merge":
+            return existing.merge_with(new_memory, strategy="confidence_weighted")
+        else:  # auto
+            new_conf = new_memory.compute_decayed_confidence()
+            existing_conf = existing.compute_decayed_confidence()
+            
+            # 优先保留置信度高的
+            if abs(new_conf - existing_conf) > 0.1:
+                return new_memory if new_conf > existing_conf else existing
+            
+            # 置信度接近时，保留较新的
+            if new_memory.updated_at >= existing.updated_at:
+                return existing.merge_with(new_memory, strategy="confidence_weighted")
+            else:
+                return existing.merge_with(new_memory, strategy="confidence_weighted")
+    
+    def get_memories(
+        self, 
+        category: Optional[str] = None,
+        min_confidence: float = 0.3,
+        limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """
+        获取记忆列表
+        
+        参数:
+        - category: 过滤类别 (None 表示全部)
+        - min_confidence: 最小置信度阈值
+        - limit: 最大返回数量
+        """
+        results = []
+        
+        for memory in self.long_term_memories.values():
+            # 类别过滤
+            if category and memory.category != category:
+                continue
+            
+            # 置信度过滤
+            current_conf = memory.compute_decayed_confidence()
+            if current_conf < min_confidence:
+                continue
+            
+            # 记录访问
+            memory.record_access()
+            
+            results.append({
+                "id": memory.id,
+                "category": memory.category,
+                "content": memory.content,
+                "confidence": current_conf,
+                "access_count": memory.access_count,
+                "created_at": memory.created_at.isoformat(),
+                "updated_at": memory.updated_at.isoformat()
+            })
+        
+        # 按置信度降序排序
+        results.sort(key=lambda x: x["confidence"], reverse=True)
+        
+        return results[:limit]
+    
+    def prune_memories(self, threshold: float = 0.2) -> int:
+        """
+        剪枝低置信度记忆
+        
+        返回：被删除的记忆数量
+        """
+        to_remove = []
+        
+        for memory_id, memory in self.long_term_memories.items():
+            if memory.should_prune(threshold):
+                to_remove.append(memory_id)
+        
+        for memory_id in to_remove:
+            del self.long_term_memories[memory_id]
+        
+        # 同步清理状态中的记忆
+        self.state.long_term_memories = [
+            m for m in self.state.long_term_memories
+            if m["id"] not in to_remove
+        ]
+        
+        return len(to_remove)
+    
+    def apply_decay_to_all_memories(self):
+        """对所有记忆应用衰减 (定期调用)"""
+        for memory in self.long_term_memories.values():
+            # compute_decayed_confidence 会自动计算当前置信度
+            # 这里可以添加日志或监控
+            current_conf = memory.compute_decayed_confidence()
+            if current_conf < 0.1:
+                # 极低置信度记忆标记为待删除
+                pass
+    
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """获取记忆统计信息"""
+        total = len(self.long_term_memories)
+        by_category = {}
+        avg_confidence = 0
+        
+        for memory in self.long_term_memories.values():
+            cat = memory.category
+            if cat not in by_category:
+                by_category[cat] = {"count": 0, "total_conf": 0}
+            by_category[cat]["count"] += 1
+            conf = memory.compute_decayed_confidence()
+            by_category[cat]["total_conf"] += conf
+            avg_confidence += conf
+        
+        # 计算各类别平均置信度
+        for cat in by_category:
+            count = by_category[cat]["count"]
+            by_category[cat]["avg_confidence"] = by_category[cat]["total_conf"] / count if count > 0 else 0
+        
+        return {
+            "total_memories": total,
+            "by_category": by_category,
+            "avg_confidence": avg_confidence / total if total > 0 else 0,
+            "queue_size": len(self._memory_write_queue)
         }
