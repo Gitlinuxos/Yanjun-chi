@@ -3,9 +3,10 @@ Pydantic 数据模型定义
 用于结构化存储旅行计划相关数据
 """
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
 from enum import Enum
+import hashlib
 
 
 class TravelStyle(str, Enum):
@@ -175,6 +176,73 @@ class WeatherInfo(BaseModel):
     # 建议
     advice: str = Field(default="", description="出行建议")
     warning: Optional[str] = Field(default=None, description="预警信息")
+
+
+class StatePatch(BaseModel):
+    """
+    状态修改补丁：封装单个 Agent 的修改意图
+    """
+    agent_id: str = Field(description="提交修改的 Agent ID")
+    target_path: str = Field(description="JSONPath 风格的目标路径，如 'user_profile.preferences' 或 'itinerary.days.0'")
+    operation: Literal["update", "append", "delete"] = Field(description="操作类型")
+    value: Any = Field(default=None, description="新值")
+    base_version_hash: str = Field(description="提交时的状态哈希，用于乐观锁检查")
+    timestamp: datetime = Field(default_factory=datetime.now)
+    description: str = Field(default="", description="修改描述")
+    
+    def get_patch_id(self) -> str:
+        """生成唯一补丁 ID"""
+        return f"{self.agent_id}_{self.timestamp.isoformat()}"
+
+
+class ConflictInfo(BaseModel):
+    """冲突详情"""
+    patch_id_1: str = Field(description="第一个冲突补丁 ID")
+    patch_id_2: str = Field(description="第二个冲突补丁 ID")
+    path: str = Field(description="冲突路径")
+    reason: str = Field(description="冲突原因：write-write conflict / version mismatch")
+    resolution: Optional[str] = Field(default=None, description="解决建议")
+
+
+class StagingArea(BaseModel):
+    """
+    临时区：存储待提交的修改补丁
+    实现两阶段提交 (2PC) 的 Prepare 阶段
+    """
+    patches: List[StatePatch] = Field(default_factory=list)
+    is_locked: bool = Field(default=False, description="是否已锁定，防止并发修改")
+    created_at: datetime = Field(default_factory=datetime.now)
+    version_hash: Optional[str] = Field(default=None, description="创建时的状态版本哈希")
+    
+    def add_patch(self, patch: StatePatch):
+        """添加补丁到临时区"""
+        self.patches.append(patch)
+        
+    def clear(self):
+        """清空临时区"""
+        self.patches = []
+        self.is_locked = False
+        self.version_hash = None
+        
+    def get_patches_by_agent(self, agent_id: str) -> List[StatePatch]:
+        """获取指定 Agent 的所有补丁"""
+        return [p for p in self.patches if p.agent_id == agent_id]
+        
+    def has_conflicts(self) -> bool:
+        """检查是否存在路径冲突（简单版：同一路径被多次修改）"""
+        paths = [p.target_path for p in self.patches]
+        return len(paths) != len(set(paths))
+        
+    def get_conflicting_patches(self) -> List[tuple]:
+        """返回所有冲突的补丁对"""
+        conflicts = []
+        path_map = {}
+        for patch in self.patches:
+            if patch.target_path in path_map:
+                conflicts.append((path_map[patch.target_path], patch))
+            else:
+                path_map[patch.target_path] = patch
+        return conflicts
 
 
 class TravelPlanState(BaseModel):

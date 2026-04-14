@@ -9,7 +9,7 @@ from datetime import datetime
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-from .models import TravelPlanState, UserProfile, Destination
+from .models import TravelPlanState, UserProfile, Destination, StatePatch, StagingArea, ConflictInfo
 from config import (
     CACHE_TTL_WEATHER, CACHE_TTL_TRANSPORT, CACHE_TTL_GENERAL,
     CACHE_SIMILARITY_THRESHOLD
@@ -71,6 +71,7 @@ class StateManager:
     状态管理器
     - 维护旅行计划共享状态
     - 提供 KV-Cache 语义检索
+    - 实现临时区 (Staging Area) 和两阶段提交
     """
     
     def __init__(self):
@@ -85,20 +86,37 @@ class StateManager:
         
         # 缓存锁 (防止并发重复请求)
         self._pending_requests: Dict[str, bool] = {}
+        
+        # 临时区 (Staging Area)
+        self.staging_area: Optional[StagingArea] = None
+        
+        # 状态版本哈希 (用于乐观锁)
+        self._version_hash: str = self._compute_state_hash()
+    
+    def _compute_state_hash(self) -> str:
+        """计算当前状态的哈希值"""
+        state_json = self.state.model_dump_json()
+        return hashlib.sha256(state_json.encode()).hexdigest()
     
     def get_state(self) -> TravelPlanState:
         """获取当前状态"""
         return self.state
     
+    def get_version_hash(self) -> str:
+        """获取当前状态版本哈希"""
+        return self._version_hash
+    
     def update_profile(self, profile: UserProfile):
         """更新用户画像"""
         self.state.user_profile = profile
         self.state.updated_at = datetime.now()
+        self._version_hash = self._compute_state_hash()
     
     def add_destination(self, dest: Destination):
         """添加推荐目的地"""
         self.state.recommended_destinations.append(dest)
         self.state.updated_at = datetime.now()
+        self._version_hash = self._compute_state_hash()
     
     def select_destination(self, name: str) -> bool:
         """选择目的地"""
@@ -106,8 +124,135 @@ class StateManager:
             if dest.name == name:
                 self.state.selected_destination = dest
                 self.state.updated_at = datetime.now()
+                self._version_hash = self._compute_state_hash()
                 return True
         return False
+    
+    # ========== 临时区 (Staging Area) 管理方法 ==========
+    
+    def create_staging_area(self) -> StagingArea:
+        """创建新的临时区"""
+        if self.staging_area and not self.staging_area.is_locked:
+            # 如果已有未提交的临时区，先清空
+            self.staging_area.clear()
+        
+        self.staging_area = StagingArea(
+            version_hash=self._version_hash,
+            is_locked=True
+        )
+        return self.staging_area
+    
+    def submit_patch(self, patch: StatePatch) -> Tuple[bool, Optional[ConflictInfo]]:
+        """
+        提交补丁到临时区 (Phase 1 of 2PC)
+        返回：(是否成功，冲突信息)
+        """
+        if not self.staging_area:
+            return False, ConflictInfo(
+                patch_id_1="none",
+                patch_id_2="none",
+                path="none",
+                reason="Staging area not initialized"
+            )
+        
+        # 检查版本一致性
+        if patch.base_version_hash != self._version_hash:
+            return False, ConflictInfo(
+                patch_id_1=patch.get_patch_id(),
+                patch_id_2="current_state",
+                path=patch.target_path,
+                reason="version_mismatch",
+                resolution="Please fetch latest state and retry"
+            )
+        
+        # 添加到临时区
+        self.staging_area.add_patch(patch)
+        return True, None
+    
+    def check_conflicts(self) -> List[ConflictInfo]:
+        """检查临时区内的冲突"""
+        if not self.staging_area:
+            return []
+        
+        conflicts = []
+        conflicting_patches = self.staging_area.get_conflicting_patches()
+        
+        for patch1, patch2 in conflicting_patches:
+            conflicts.append(ConflictInfo(
+                patch_id_1=patch1.get_patch_id(),
+                patch_id_2=patch2.get_patch_id(),
+                path=patch1.target_path,
+                reason="write-write_conflict",
+                resolution="Keep one value or merge manually"
+            ))
+        
+        return conflicts
+    
+    def commit_staging(self) -> Tuple[bool, str]:
+        """
+        提交临时区的所有补丁到主状态 (Phase 2 of 2PC)
+        返回：(是否成功，消息)
+        """
+        if not self.staging_area:
+            return False, "No staging area to commit"
+        
+        # 检查是否有冲突
+        conflicts = self.check_conflicts()
+        if conflicts:
+            return False, f"Found {len(conflicts)} conflicts. Please resolve first."
+        
+        # 应用所有补丁
+        for patch in self.staging_area.patches:
+            self._apply_patch(patch)
+        
+        # 更新版本哈希
+        self._version_hash = self._compute_state_hash()
+        self.state.updated_at = datetime.now()
+        
+        # 清空临时区
+        self.staging_area.clear()
+        self.staging_area = None
+        
+        return True, "Successfully committed all changes"
+    
+    def abort_staging(self):
+        """放弃临时区的所有修改"""
+        if self.staging_area:
+            self.staging_area.clear()
+            self.staging_area = None
+    
+    def _apply_patch(self, patch: StatePatch):
+        """应用单个补丁到主状态"""
+        # 简单的路径解析和应用 (生产环境应使用更完善的 JSONPath 库)
+        parts = patch.target_path.split('.')
+        
+        current = self.state.model_dump()
+        
+        # 处理 user_profile 为 None 的情况
+        if parts[0] == 'user_profile' and current.get('user_profile') is None:
+            current['user_profile'] = {}
+        
+        parent = current
+        for i, part in enumerate(parts[:-1]):
+            if part.isdigit():
+                parent = parent[int(part)]
+            else:
+                if parent.get(part) is None:
+                    parent[part] = {}
+                parent = parent[part]
+        
+        last_key = parts[-1]
+        if patch.operation == "update":
+            parent[last_key] = patch.value
+        elif patch.operation == "delete":
+            if last_key in parent:
+                del parent[last_key]
+        elif patch.operation == "append":
+            if isinstance(parent.get(last_key), list):
+                parent[last_key].append(patch.value)
+        
+        # 重新加载状态
+        self.state = TravelPlanState.model_validate(current)
     
     def clear_cache(self, category: Optional[str] = None):
         """清理缓存"""
