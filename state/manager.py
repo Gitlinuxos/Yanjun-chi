@@ -394,7 +394,8 @@ class StateManager:
         category: str,
         content: Dict[str, Any],
         confidence: float = 1.0,
-        immediate: bool = False
+        immediate: bool = False,
+        half_life: Optional[float] = None
     ) -> Tuple[bool, str]:
         """
         添加/更新长期记忆
@@ -405,6 +406,7 @@ class StateManager:
         - content: 记忆内容
         - confidence: 初始置信度
         - immediate: 是否立即写回 (高优先级记忆可设为 True)
+        - half_life: 半衰期 (天)，不传则使用默认值
         
         返回：(是否成功，消息)
         """
@@ -422,29 +424,46 @@ class StateManager:
             existing.record_access()
             existing.updated_at = datetime.now()
             existing.content = content
+            existing.confidence = max(existing.confidence, confidence)
             return True, f"Updated existing memory: {memory_id}"
         
         # 创建新记忆条目
         decay_rate = self.MEMORY_DECAY_RATES.get(category, 0.01)
+        
+        # 根据类别设置默认半衰期
+        if half_life is None:
+            half_life_map = {
+                "user_profile": 90.0,     # 用户画像半衰期长
+                "identity": 60.0,
+                "business_fact": 30.0,
+                "reflection": 14.0,       # 反思结果半衰期短
+                "general": 7.0            # 一般信息半衰期最短
+            }
+            half_life = half_life_map.get(category, 30.0)
+        
         new_memory = MemoryEntry(
             id=memory_id,
             agent_id=agent_id,
             category=category,
             content=content,
             confidence=confidence,
-            decay_rate=decay_rate
+            decay_rate=decay_rate,
+            half_life=half_life
         )
         
-        # 加入写入队列 (优先级，记忆)
-        priority = self.MEMORY_PRIORITY.get(category, 0.5)
+        # 计算初始写回优先级
+        new_memory.write_back_priority = new_memory.compute_write_back_priority()
+        
+        # 加入写入队列 (负优先级用于最大堆)
+        priority = new_memory.write_back_priority
         heapq.heappush(self._memory_write_queue, (-priority, new_memory))
         
-        if immediate or priority >= 0.9:
+        if immediate or priority >= 0.85:
             # 高优先级记忆立即写回
             self._commit_memory_to_state(new_memory)
-            return True, f"High-priority memory committed immediately: {memory_id}"
+            return True, f"High-priority memory committed immediately: {memory_id} (priority={priority:.2f})"
         
-        return True, f"Memory queued for write-back: {memory_id} (priority: {priority})"
+        return True, f"Memory queued for write-back: {memory_id} (priority={priority:.2f})"
     
     def flush_memory_queue(self, max_items: int = 10) -> int:
         """
@@ -525,29 +544,70 @@ class StateManager:
         解决记忆冲突
         
         策略:
-        - auto: 自动选择 (基于置信度和时间戳)
-        - merge: 合并两个记忆
+        - auto: 自动选择 (基于置信度、时间戳和类别重要性)
+        - merge: 合并两个记忆 (支持 confidence_weighted/temporal_decay)
         - keep_new: 保留新的
         - keep_existing: 保留现有的
+        - higher_confidence: 保留置信度高的
+        - latest_timestamp: 保留时间戳最新的
         """
         if strategy == "keep_new":
             return new_memory
         elif strategy == "keep_existing":
             return existing
+        elif strategy == "higher_confidence":
+            new_conf = new_memory.compute_decayed_confidence()
+            existing_conf = existing.compute_decayed_confidence()
+            return new_memory if new_conf > existing_conf else existing
+        elif strategy == "latest_timestamp":
+            return new_memory if new_memory.updated_at >= existing.updated_at else existing
         elif strategy == "merge":
+            # 默认使用 confidence_weighted 合并策略
             return existing.merge_with(new_memory, strategy="confidence_weighted")
-        else:  # auto
+        else:  # auto - 智能决策
             new_conf = new_memory.compute_decayed_confidence()
             existing_conf = existing.compute_decayed_confidence()
             
-            # 优先保留置信度高的
-            if abs(new_conf - existing_conf) > 0.1:
-                return new_memory if new_conf > existing_conf else existing
+            # 1. 检查置信度差异是否显著 (>0.15)
+            conf_diff = abs(new_conf - existing_conf)
+            if conf_diff > 0.15:
+                # 置信度差异显著，直接选择高的
+                winner = new_memory if new_conf > existing_conf else existing
+                return winner
             
-            # 置信度接近时，保留较新的
-            if new_memory.updated_at >= existing.updated_at:
+            # 2. 置信度接近时，考虑类别重要性
+            category_importance = {
+                "user_profile": 1.0,
+                "identity": 0.95,
+                "business_fact": 0.9,
+                "reflection": 0.85,
+                "general": 0.5
+            }
+            new_importance = category_importance.get(new_memory.category, 0.5)
+            existing_importance = category_importance.get(existing.category, 0.5)
+            
+            importance_diff = abs(new_importance - existing_importance)
+            if importance_diff > 0.1:
+                # 类别重要性差异显著，选择重要的
+                winner = new_memory if new_importance > existing_importance else existing
+                return winner
+            
+            # 3. 类别相同或重要性接近，考虑时间戳
+            time_diff_hours = abs((new_memory.updated_at - existing.updated_at).total_seconds()) / 3600
+            if time_diff_hours > 24:
+                # 时间差超过 24 小时，保留较新的
+                return new_memory if new_memory.updated_at >= existing.updated_at else existing
+            
+            # 4. 时间也很接近，采用加权合并
+            # 根据具体场景选择合适的合并策略
+            if new_memory.access_count > existing.access_count * 2:
+                # 新记忆访问次数远多于旧记忆，倾向于新记忆
+                return new_memory.merge_with(existing, strategy="confidence_weighted")
+            elif existing.access_count > new_memory.access_count * 2:
+                # 旧记忆访问次数远多于新记忆，倾向于旧记忆
                 return existing.merge_with(new_memory, strategy="confidence_weighted")
             else:
+                # 访问次数相近，按置信度加权合并
                 return existing.merge_with(new_memory, strategy="confidence_weighted")
     
     def get_memories(

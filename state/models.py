@@ -7,6 +7,7 @@ from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
 from enum import Enum
 import hashlib
+import numpy as np
 
 
 class TravelStyle(str, Enum):
@@ -207,7 +208,7 @@ class ConflictInfo(BaseModel):
 class MemoryEntry(BaseModel):
     """
     长期记忆条目
-    支持衰减策略和冲突解决
+    支持高级衰减策略、智能冲突解决和优先级写回
     """
     id: str = Field(description="记忆唯一 ID")
     agent_id: str = Field(description="创建/更新该记忆的 Agent ID")
@@ -225,44 +226,141 @@ class MemoryEntry(BaseModel):
     
     # 衰减参数
     decay_rate: float = Field(default=0.01, description="基础衰减率 (每天)")
+    half_life: float = Field(default=30.0, description="半衰期 (天)")
     usage_boost: float = Field(default=0.05, description="每次访问提升的置信度")
     max_confidence: float = Field(default=1.0, description="最大置信度")
+    min_confidence: float = Field(default=0.0, description="最小置信度")
+    
+    # 写回控制
+    write_back_priority: float = Field(default=0.5, description="写回优先级 (0-1)")
+    pending_write: bool = Field(default=False, description="是否等待写回")
     
     def compute_decayed_confidence(self) -> float:
         """
         计算衰减后的置信度
-        混合衰减策略：时间衰减 + 使用频率加权 + 置信度自衰减
+        混合衰减策略：时间指数衰减 + 使用频率加权 + 置信度自调节 + 半衰期控制
+        
+        公式：
+        conf(t) = conf_0 * exp(-λ*t) * (1 + α*log(1+n)) * (1 - β*(1-conf_0))
+        
+        其中：
+        - λ: 衰减率 (与半衰期相关：λ = ln(2) / half_life)
+        - α: 使用频率增益系数
+        - n: 访问次数
+        - β: 初始置信度调节系数
         """
         now = datetime.now()
         
-        # 时间衰减 (指数衰减)
+        # 1. 时间衰减 (指数衰减模型)
         days_elapsed = (now - self.created_at).total_seconds() / 86400
-        time_decay = self.decay_rate * days_elapsed
+        decay_lambda = np.log(2) / self.half_life  # 通过半衰期计算衰减常数
+        time_decay_factor = np.exp(-decay_lambda * days_elapsed)
         
-        # 使用频率加权 (访问越频繁，衰减越慢)
-        usage_factor = 1.0 / (1.0 + self.access_count * 0.1)
+        # 2. 使用频率加权 (对数增长，避免过度放大)
+        # 访问越频繁，衰减补偿越多，但有上限
+        usage_factor = 1.0 + 0.15 * np.log1p(self.access_count)
+        usage_factor = min(usage_factor, 1.5)  # 上限 1.5 倍
         
-        # 置信度自衰减 (高置信度信息衰减更慢)
-        confidence_factor = 1.0 - (self.confidence * 0.3)
+        # 3. 最近访问衰减 (最后访问时间越近，置信度越高)
+        recency_factor = 1.0
+        if self.last_accessed:
+            days_since_access = (now - self.last_accessed).total_seconds() / 86400
+            # 7 天内访问过有加成
+            recency_factor = 1.0 + 0.1 * max(0, (7 - days_since_access) / 7)
         
-        # 综合衰减系数
-        total_decay = time_decay * usage_factor * confidence_factor
+        # 4. 置信度自调节 (高置信度信息更稳定)
+        stability_factor = 0.7 + 0.3 * self.confidence
         
-        # 计算衰减后置信度
-        decayed = self.confidence - total_decay
+        # 5. 类别重要性加权 (从父类获取)
+        category_weights = {
+            "user_profile": 1.2,
+            "identity": 1.15,
+            "business_fact": 1.1,
+            "reflection": 1.0,
+            "general": 0.9
+        }
+        category_factor = category_weights.get(self.category, 1.0)
         
-        return max(0.0, min(decayed, self.max_confidence))
+        # 综合计算
+        base_decay = self.confidence * time_decay_factor
+        adjusted_conf = base_decay * usage_factor * recency_factor * stability_factor * category_factor
+        
+        # 边界约束
+        final_conf = max(self.min_confidence, min(adjusted_conf, self.max_confidence))
+        
+        return round(final_conf, 4)
     
-    def record_access(self):
-        """记录访问，提升置信度"""
+    def compute_write_back_priority(self) -> float:
+        """
+        计算写回优先级
+        综合考虑：类别重要性 + 置信度 + 时效性 + 访问频率
+        
+        返回：0-1 之间的优先级分数
+        """
+        # 1. 类别基础优先级
+        category_priority = {
+            "user_profile": 1.0,
+            "identity": 0.95,
+            "business_fact": 0.9,
+            "reflection": 0.85,
+            "general": 0.5
+        }
+        base_score = category_priority.get(self.category, 0.5)
+        
+        # 2. 置信度加权 (置信度越高越优先)
+        conf_weight = self.compute_decayed_confidence()
+        
+        # 3. 时效性 (新创建或刚更新的优先)
+        now = datetime.now()
+        hours_since_update = (now - self.updated_at).total_seconds() / 3600
+        freshness_score = max(0, 1.0 - hours_since_update / 24)  # 24 小时内为高分
+        
+        # 4. 访问频率 (经常被访问的记忆更重要)
+        frequency_score = min(1.0, self.access_count / 10)
+        
+        # 综合计算 (加权平均)
+        priority = (
+            base_score * 0.4 +      # 类别权重 40%
+            conf_weight * 0.3 +     # 置信度权重 30%
+            freshness_score * 0.2 + # 时效性权重 20%
+            frequency_score * 0.1   # 频率权重 10%
+        )
+        
+        return round(min(1.0, max(0.0, priority)), 4)
+    
+    def record_access(self, update_confidence: bool = True):
+        """
+        记录访问，可选地提升置信度
+        
+        参数:
+        - update_confidence: 是否同时提升置信度 (某些场景下只记录访问不提升置信度)
+        """
         self.access_count += 1
         self.last_accessed = datetime.now()
-        # 访问提升置信度，但不超过最大值
-        self.confidence = min(self.confidence + self.usage_boost, self.max_confidence)
+        
+        if update_confidence:
+            # 访问提升置信度，但有上限且增益递减
+            current_conf = self.confidence
+            boost = self.usage_boost * (1.0 / (1.0 + self.access_count * 0.05))
+            self.confidence = min(current_conf + boost, self.max_confidence)
+        
+        # 重新计算写回优先级
+        self.write_back_priority = self.compute_write_back_priority()
+        self.pending_write = True
     
     def should_prune(self, threshold: float = 0.2) -> bool:
-        """判断是否应该被剪枝 (置信度过低)"""
-        return self.compute_decayed_confidence() < threshold
+        """判断是否应该被剪枝 (置信度过低且长时间未访问)"""
+        current_conf = self.compute_decayed_confidence()
+        
+        # 双重条件：置信度低 AND 长时间未访问
+        if current_conf < threshold:
+            if self.last_accessed:
+                days_since_access = (datetime.now() - self.last_accessed).total_seconds() / 86400
+                return days_since_access > 7  # 7 天以上未访问才剪枝
+            else:
+                return True  # 从未被访问过的低置信度记忆直接剪枝
+        
+        return False
     
     def merge_with(self, other: 'MemoryEntry', strategy: str = "confidence_weighted") -> 'MemoryEntry':
         """
@@ -271,6 +369,7 @@ class MemoryEntry(BaseModel):
         - confidence_weighted: 按置信度加权平均
         - latest: 保留最新的
         - higher_confidence: 保留置信度高的
+        - temporal_decay: 考虑时间衰减的加权
         """
         if strategy == "latest":
             if self.updated_at >= other.updated_at:
@@ -286,7 +385,33 @@ class MemoryEntry(BaseModel):
             else:
                 return other
         
-        else:  # confidence_weighted
+        elif strategy == "temporal_decay":
+            # 考虑时间衰减的加权：新信息权重更高
+            self_conf = self.compute_decayed_confidence()
+            other_conf = other.compute_decayed_confidence()
+            
+            # 时间权重：越新的信息权重越高
+            now = datetime.now()
+            self_age = (now - self.updated_at).total_seconds() / 86400
+            other_age = (now - other.updated_at).total_seconds() / 86400
+            
+            self_time_weight = np.exp(-0.05 * self_age)
+            other_time_weight = np.exp(-0.05 * other_age)
+            
+            # 综合权重 = 置信度权重 * 时间权重
+            self_final_weight = self_conf * self_time_weight
+            other_final_weight = other_conf * other_time_weight
+            
+            total_weight = self_final_weight + other_final_weight
+            if total_weight == 0:
+                return self
+            
+            if self_final_weight >= other_final_weight:
+                return self
+            else:
+                return other
+        
+        else:  # confidence_weighted (默认)
             self_conf = self.compute_decayed_confidence()
             other_conf = other.compute_decayed_confidence()
             total_conf = self_conf + other_conf
@@ -309,7 +434,10 @@ class MemoryEntry(BaseModel):
                 elif isinstance(self_val, (int, float)) and isinstance(other_val, (int, float)):
                     # 数值类型加权平均
                     weight_self = self_conf / total_conf
-                    merged_content[key] = self_val * weight_self + other_val * (1 - weight_self)
+                    merged_content[key] = round(self_val * weight_self + other_val * (1 - weight_self), 2)
+                elif isinstance(self_val, list) and isinstance(other_val, list):
+                    # 列表类型：合并去重
+                    merged_content[key] = list(set(self_val + other_val))
                 else:
                     # 非数值类型：选择置信度高的
                     if self_conf >= other_conf:
@@ -318,7 +446,7 @@ class MemoryEntry(BaseModel):
                         merged_content[key] = other_val
             
             # 创建合并后的新条目
-            new_confidence = (self_conf * self_conf + other_conf * other_conf) / (self_conf + other_conf) if total_conf > 0 else 0
+            new_confidence = (self_conf * self_conf + other_conf * other_conf) / total_conf if total_conf > 0 else 0
             
             return MemoryEntry(
                 id=self.id,  # 保留较早的 ID
@@ -334,6 +462,7 @@ class MemoryEntry(BaseModel):
                     other.last_accessed or other.created_at
                 ),
                 decay_rate=self.decay_rate,
+                half_life=self.half_life,
                 usage_boost=self.usage_boost,
                 max_confidence=self.max_confidence
             )
