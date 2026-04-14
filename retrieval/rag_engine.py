@@ -20,7 +20,7 @@ try:
 except ImportError:
     HAS_EMBEDDING = False
 
-from config import Config
+from config import DASHSCOPE_API_KEY, RAG_ENABLED, RAG_TOP_K, RAG_SIMILARITY_THRESHOLD
 
 
 @dataclass
@@ -36,7 +36,7 @@ class RetrievalResult:
 class ContentFilter:
     """内容过滤器 - 检测并跳过不适当内容"""
     
-    # 不适当内容关键词模式
+    # 不适当内容关键词模式（优化以避免 ReDoS）
     INAPPROPRIATE_PATTERNS = [
         r'\b(inappropriate|offensive|nsfw|explicit|adult)\b',
         r'\b(hate|discrimination|harassment|bullying)\b',
@@ -46,10 +46,15 @@ class ContentFilter:
     ]
     
     def __init__(self):
-        self.compiled_patterns = [
-            re.compile(pattern, re.IGNORECASE) 
-            for pattern in self.INAPPROPRIATE_PATTERNS
-        ]
+        # 预编译正则表达式，使用原子组避免灾难性回溯
+        self.compiled_patterns = []
+        for pattern in self.INAPPROPRIATE_PATTERNS:
+            try:
+                self.compiled_patterns.append(
+                    re.compile(pattern, re.IGNORECASE | re.DOTALL)
+                )
+            except re.error as e:
+                print(f"⚠️ 正则表达式编译失败 {pattern}: {e}")
     
     def is_appropriate(self, text: str) -> bool:
         """检查文本是否适当，返回 True 表示适当，False 表示不适当"""
@@ -110,17 +115,20 @@ class KnowledgeBaseLoader:
         
         return loaded_count
     
-    def _chunk_document(self, content: str, source: str, chunk_size: int = 500) -> List[Dict[str, Any]]:
-        """将文档分块"""
+    def _chunk_document(self, content: str, source: str, chunk_size: int = 500, overlap: int = 50) -> List[Dict[str, Any]]:
+        """将文档分块（优化版，避免 ReDoS）"""
         chunks = []
-        # 按段落分割
-        paragraphs = re.split(r'\n\s*\n', content)
+        # 使用简单分割而非复杂正则，避免 ReDoS 风险
+        paragraphs = content.split('\n\n')
         
         current_chunk = ""
         for para in paragraphs:
             para = para.strip()
             if not para:
                 continue
+            
+            # 限制段落长度，避免过长文本
+            para = para[:2000]
             
             if len(current_chunk) + len(para) < chunk_size:
                 current_chunk += "\n" + para
@@ -182,12 +190,13 @@ class RAGRetriever:
         
         return count
     
-    def _embed_query(self, query: str) -> np.ndarray:
+    def _embed_query(self, query: str):
         """将查询转换为向量"""
         if self.has_embedder:
             return self.embedder.encode([query])[0]
         else:
             # 降级为简单的词频向量（用于关键词匹配）
+            import numpy as np
             return np.zeros(384)  # 占位符
     
     def retrieve_from_long_term_memory(

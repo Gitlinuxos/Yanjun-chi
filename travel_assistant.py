@@ -118,7 +118,10 @@ class TravelAssistant:
             return response
             
         except Exception as e:
-            error_msg = f"处理请求时出错：{str(e)}"
+            # 避免泄露敏感异常信息，仅记录日志，返回通用错误消息
+            import logging
+            logging.error(f"处理请求时发生异常：{type(e).__name__}")
+            error_msg = "处理请求时出错，请稍后重试或联系管理员。"
             print(f"[ERROR] {error_msg}")
             return error_msg
     
@@ -171,9 +174,13 @@ class TravelAssistant:
         return "收到您的需求，我正在为您规划...请稍等。"
     
     async def run_cli(self):
-        """运行命令行交互界面"""
+        """运行命令行交互界面（带速率限制）"""
         print("🤖 旅行助手：您好！我是您的智能旅行规划助手。")
         print("   请告诉我您想去哪里，或者您喜欢的旅行类型？\n")
+        
+        # 速率限制配置
+        max_requests_per_minute = 10
+        request_timestamps = []
         
         while True:
             try:
@@ -190,6 +197,18 @@ class TravelAssistant:
                 if user_input.lower() in ["help", "帮助", "?"]:
                     self._print_help()
                     continue
+                
+                # 速率限制检查
+                import time
+                current_time = time.time()
+                # 移除超过 60 秒的请求记录
+                request_timestamps = [ts for ts in request_timestamps if current_time - ts < 60]
+                
+                if len(request_timestamps) >= max_requests_per_minute:
+                    print(f"\n⚠️  请求过于频繁，请稍后再试（限制：{max_requests_per_minute} 次/分钟）\n")
+                    continue
+                
+                request_timestamps.append(current_time)
                 
                 # 处理输入
                 print("\n🤖 旅行助手：正在思考中...", end="", flush=True)

@@ -75,9 +75,9 @@ class WebServices:
             return self._mock_weather(city, days)
         
         try:
-            # 这里以 OpenWeatherMap 为例
+            # 使用 HTTPS 而非 HTTP 以确保安全传输
             response = self.session.get(
-                f"http://api.openweathermap.org/data/2.5/forecast",
+                f"https://api.openweathermap.org/data/2.5/forecast",
                 params={
                     'q': city,
                     'appid': WEATHER_API_KEY,
